@@ -22,6 +22,13 @@
 #include <sys/types.h>
 #endif
 
+#ifdef _DEBUG
+#undef FIXED_TIME
+#define FIXED_TIME
+#undef FIXED_RANDOM
+#define FIXED_RANDOM
+#endif
+
 /* get system time */
 static inline void itimeofday(long *sec, long *usec)
 {
@@ -50,14 +57,22 @@ static inline void itimeofday(long *sec, long *usec)
 	#endif
 }
 
+#ifdef FIXED_TIME
+IINT64 curTime = 0;
+#endif
+
 /* get clock in millisecond 64 */
 static inline IINT64 iclock64(void)
 {
+#ifdef FIXED_TIME
+	return curTime;
+#else
 	long s, u;
 	IINT64 value;
 	itimeofday(&s, &u);
 	value = ((IINT64)s) * 1000 + (u / 1000);
 	return value;
+#endif
 }
 
 static inline IUINT32 iclock()
@@ -68,6 +83,9 @@ static inline IUINT32 iclock()
 /* sleep in millisecond */
 static inline void isleep(unsigned long millisecond)
 {
+#ifdef FIXED_TIME
+	curTime += millisecond;
+#else
 	#ifdef __unix 	/* usleep( time * 1000 ); */
 	struct timespec ts;
 	ts.tv_sec = (time_t)(millisecond / 1000);
@@ -77,6 +95,7 @@ static inline void isleep(unsigned long millisecond)
 	#elif defined(_WIN32)
 	Sleep(millisecond);
 	#endif
+#endif
 }
 
 #ifdef __cplusplus
@@ -88,7 +107,7 @@ class DelayPacket
 {
 public:
 	virtual ~DelayPacket() {
-		if (_ptr) delete _ptr;
+		if (_ptr) delete[] _ptr;
 		_ptr = NULL;
 	}
 
@@ -113,10 +132,24 @@ protected:
 	IUINT32 _ts;
 };
 
+#ifdef FIXED_RANDOM
+int seed = 0;
+#endif
+
 // 均匀分布的随机数
 class Random
 {
 public:
+	static int nextInt(int n)
+	{
+	#ifdef FIXED_RANDOM
+		seed = (seed * 987654321 + 123456789) & 0x7fffffff;
+		return seed % n;
+	#else
+		return rand() % n;
+	#endif
+	}
+
 	Random(int size) {
 		this->size = 0;
 		seeds.resize(size);
@@ -131,7 +164,7 @@ public:
 			}
 			size = (int)seeds.size();
 		}
-		i = rand() % size;
+		i = nextInt(size);
 		x = seeds[i];
 		seeds[i] = seeds[--size];
 		return x;
@@ -192,7 +225,7 @@ public:
 		DelayPacket *pkt = new DelayPacket(size, data);
 		current = iclock();
 		IUINT32 delay = rttmin;
-		if (rttmax > rttmin) delay += rand() % (rttmax - rttmin);
+		if (rttmax > rttmin) delay += Random::nextInt(rttmax - rttmin);
 		pkt->setts(current + delay);
 		if (peer == 0) {
 			p12.push_back(pkt);

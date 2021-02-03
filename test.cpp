@@ -3,7 +3,7 @@
 // test.cpp - kcp 测试用例
 //
 // 说明：
-// gcc test.cpp -o test -lstdc++
+// gcc ikcp.c test.cpp -o test -lstdc++
 //
 //=====================================================================
 
@@ -11,7 +11,7 @@
 #include <stdlib.h>
 
 #include "test.h"
-#include "ikcp.c"
+//#include "ikcp.c"
 
 
 // 模拟网络
@@ -26,6 +26,59 @@ int udp_output(const char *buf, int len, ikcpcb *kcp, void *user)
 	return 0;
 }
 
+void writelog(const char *log, struct IKCPCB *kcp, void *user)
+{
+	printf("%s\n", log);
+}
+
+int linkSize(IQUEUEHEAD* head)
+{
+	int n = 0;
+	for (IQUEUEHEAD* p = head->next; p != head; p = p->next)
+		n++;
+	return n;
+}
+
+void printKcp(struct IKCPCB* kcp)
+{
+	printf("conv: %d\n", kcp->conv);
+	printf("mtu: %d\n", kcp->mtu);
+	printf("mss: %d\n", kcp->mss);
+	printf("snd_una: %d\n", kcp->snd_una);
+	printf("snd_nxt: %d\n", kcp->snd_nxt);
+	printf("rcv_nxt: %d\n", kcp->rcv_nxt);
+	printf("ssthresh: %d\n", kcp->ssthresh);
+	printf("rx_rttval: %d\n", kcp->rx_rttval);
+	printf("rx_srtt: %d\n", kcp->rx_srtt);
+	printf("rx_rto: %d\n", kcp->rx_rto);
+	printf("rx_minrto: %d\n", kcp->rx_minrto);
+	printf("snd_wnd: %d\n", kcp->snd_wnd);
+	printf("rcv_wnd: %d\n", kcp->rcv_wnd);
+	printf("rmt_wnd: %d\n", kcp->rmt_wnd);
+	printf("cwnd: %d\n", kcp->cwnd);
+	printf("current: %d\n", kcp->current);
+	printf("interval: %d\n", kcp->interval);
+	printf("ts_flush: %d\n", kcp->ts_flush);
+	printf("nsnd_buf: %d\n", kcp->nsnd_buf);
+	printf("nrcv_que: %d\n", kcp->nrcv_que);
+	printf("nsnd_que: %d\n", kcp->nsnd_que);
+	printf("ts_probe: %d\n", kcp->ts_probe);
+	printf("probe_wait: %d\n", kcp->probe_wait);
+	printf("incr: %d\n", kcp->incr);
+	printf("snd_queue: [%d]\n", linkSize(&kcp->snd_queue));
+	printf("rcv_queue: [%d]\n", linkSize(&kcp->rcv_queue));
+	printf("snd_buf: [%d]\n", linkSize(&kcp->snd_buf));
+	printf("rcv_buf: [%d]\n", linkSize(&kcp->rcv_buf));
+	printf("ackcount: %d\n", kcp->ackcount);
+	printf("ackblock: %d\n", kcp->ackblock);
+	printf("fastresend: %d\n", kcp->fastresend);
+	printf("logmask: %d\n", kcp->logmask);
+	printf("probe: %d\n", kcp->probe);
+	printf("nodelay: %d\n", kcp->nodelay);
+	printf("stream: %d\n", kcp->stream);
+	printf("nocwnd: %d\n", kcp->nocwnd);
+}
+
 // 测试用例
 void test(int mode)
 {
@@ -36,6 +89,10 @@ void test(int mode)
 	// 最后一个是 user参数，用来传递标识
 	ikcpcb *kcp1 = ikcp_create(0x11223344, (void*)0);
 	ikcpcb *kcp2 = ikcp_create(0x11223344, (void*)1);
+//	kcp1->logmask = 0xff;
+//	kcp2->logmask = 0xff;
+//	kcp1->writelog = writelog;
+//	kcp2->writelog = writelog;
 
 	// 设置kcp的下层输出，这里为 udp_output，模拟udp网络输出函数
 	kcp1->output = udp_output;
@@ -48,6 +105,9 @@ void test(int mode)
 	IINT64 sumrtt = 0;
 	int count = 0;
 	int maxrtt = 0;
+
+    ikcp_update(kcp1, current);
+    ikcp_update(kcp2, current);
 
 	// 配置窗口大小：平均延迟200ms，每20ms发送一个包，
 	// 而考虑到丢包重发，设置最大收发窗口为128
@@ -144,6 +204,11 @@ void test(int mode)
 
 			printf("[RECV] mode=%d sn=%d rtt=%d\n", mode, (int)sn, (int)rtt);
 		}
+//		printf("------ current: %d\n", current);
+//		printKcp(kcp1);
+//		printf("------\n");
+//		printKcp(kcp2);
+//		printf("------\n");
 		if (next > 1000) break;
 	}
 
@@ -155,8 +220,8 @@ void test(int mode)
 	const char *names[3] = { "default", "normal", "fast" };
 	printf("%s mode result (%dms):\n", names[mode], (int)ts1);
 	printf("avgrtt=%d maxrtt=%d tx=%d\n", (int)(sumrtt / count), (int)maxrtt, (int)vnet->tx1);
-	printf("press enter to next ...\n");
-	char ch; scanf("%c", &ch);
+//	printf("press enter to next ...\n");
+//	char ch; scanf("%c", &ch);
 }
 
 int main()
