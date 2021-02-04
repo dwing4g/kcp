@@ -2,6 +2,7 @@ package kcp;
 
 import java.lang.reflect.Field;
 import java.lang.reflect.Modifier;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedList;
@@ -157,24 +158,40 @@ final class LatencySimulator {
 
 public final class KcpTest extends Kcp {
 	private static final boolean VERBOSE = false;
+	private static final int POOLED_SEG_SIZE = IKCP_MTU_DEF - IKCP_OVERHEAD;
+	private final ArrayList<KcpSeg> segPool = new ArrayList<KcpSeg>();
 	private final LatencySimulator vnet;
 	private final int id;
 
 	private KcpTest(LatencySimulator vnet, int id, int conv, int current) {
-		super(conv, current, false);
+		super(conv, current, IKCP_MTU_DEF, null, false);
 		this.vnet = vnet;
 		this.id = id;
 	}
 
 	// 设置kcp的下层输出，这里为 udp_output，模拟udp网络输出函数
 	@Override
-	public void output(byte[] buf, int len) {
-		vnet.send(id, buf, len);
+	public void output(int len) {
+		vnet.send(id, buffer, len);
 	}
 
-	private static int segMentSize(Segment head) {
+	@Override
+	public KcpSeg allocSeg(int size) {
+		if (size > POOLED_SEG_SIZE)
+			return new KcpSeg(size);
+		final int poolSize = segPool.size();
+		return poolSize > 0 ? segPool.remove(poolSize - 1) : new KcpSeg(POOLED_SEG_SIZE);
+	}
+
+	@Override
+	public void freeSeg(KcpSeg seg) {
+		if (seg.capacity() == POOLED_SEG_SIZE)
+			segPool.add(seg);
+	}
+
+	private static int segCount(KcpSeg head) {
 		int n = 0;
-		for (Segment p = head.next; p != head; p = p.next)
+		for (KcpSeg p = head.next(); p != head; p = p.next())
 			n++;
 		return n;
 	}
@@ -198,8 +215,8 @@ public final class KcpTest extends Kcp {
 					sb.append(field.getByte(this));
 				else if (type == boolean.class)
 					sb.append(field.getBoolean(this) ? 1 : 0);
-				else if (type == Segment.class && field.get(this) != null)
-					sb.append('[').append(segMentSize((Segment)field.get(this))).append(']');
+				else if (type == KcpSeg.class && field.get(this) != null)
+					sb.append('[').append(segCount((KcpSeg)field.get(this))).append(']');
 				else if (type == int[].class && field.get(this) != null)
 					sb.append('[').append(((int[])field.get(this)).length).append(']');
 				else if (type == byte[].class && field.get(this) != null)
@@ -214,13 +231,13 @@ public final class KcpTest extends Kcp {
 
 	private static void test(int mode) throws Exception {
 		// 创建模拟网络：丢包率10%，Rtt 60ms~125ms
-		LatencySimulator vnet = new LatencySimulator(10, 60, 125);
+		final LatencySimulator vnet = new LatencySimulator(10, 60, 125);
 		int current = vnet.getTimer().iclock();
 
 		// 创建两个端点的 kcp对象，第一个参数 conv是会话编号，同一个会话需要相同
 		// 最后一个是 user参数，用来传递标识
-		KcpTest kcp1 = new KcpTest(vnet, 0, 0x11223344, current);
-		KcpTest kcp2 = new KcpTest(vnet, 1, 0x11223344, current);
+		final KcpTest kcp1 = new KcpTest(vnet, 0, 0x11223344, current);
+		final KcpTest kcp2 = new KcpTest(vnet, 1, 0x11223344, current);
 		if (VERBOSE) {
 			kcp1.logmask(-1);
 			kcp2.logmask(-1);
@@ -259,7 +276,7 @@ public final class KcpTest extends Kcp {
 			kcp1.fastresend(1);
 		}
 
-		byte[] buf = new byte[2000];
+		final byte[] buf = new byte[2000];
 		int ts1 = vnet.getTimer().iclock();
 		do {
 			vnet.getTimer().sleep(1);
@@ -337,7 +354,7 @@ public final class KcpTest extends Kcp {
 		} while (next <= 1000);
 
 		ts1 = vnet.getTimer().iclock() - ts1;
-		String[] names = {"default", "normal", "fast"};
+		final String[] names = {"default", "normal", "fast"};
 		System.out.printf("%s mode result (%dms):\n", names[mode], ts1);
 		System.out.printf("avgrtt=%d maxrtt=%d tx=%d\n", (int)(sumrtt / count), maxrtt, vnet.tx1);
 

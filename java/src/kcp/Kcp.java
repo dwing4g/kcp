@@ -2,56 +2,6 @@ package kcp;
 
 import java.util.Arrays;
 
-final class Segment {
-	Segment prev;
-	Segment next;
-	int conv;
-	byte cmd;
-	byte frg;
-	short wnd;
-	int ts;
-	int sn;
-	int una;
-	int len;
-	int resendts;
-	int rto;
-	int fastack;
-	int xmit;
-	byte[] data;
-
-	Segment() {
-		prev = this;
-		next = this;
-	}
-
-	Segment(int size) { // send, input
-		data = new byte[size];
-	}
-
-	void linkNext(final Segment node) {
-		prev = node;
-		next = node.next;
-		next.prev = this;
-		node.next = this;
-	}
-
-	void linkTail(final Segment head) {
-		prev = head.prev;
-		next = head;
-		prev.next = this;
-		head.prev = this;
-	}
-
-	boolean isEmpty() {
-		return next == this;
-	}
-
-	void unlink() {
-		prev.next = next;
-		next.prev = prev;
-	}
-}
-
 /**
  * KCP - A Better ARQ Protocol Implementation
  * <p>Features:
@@ -92,21 +42,19 @@ public abstract class Kcp {
 	public static final int IKCP_PROBE_INIT = 7000;    // 7 secs to probe window size
 	public static final int IKCP_PROBE_LIMIT = 120000; // up to 120 secs to probe window
 	public static final int IKCP_FASTACK_LIMIT = 5;    // max times to trigger fastack
-	public static final int[] EMPTY_INTS = new int[0];
 	// struct IKCPCB
 	private final int conv;
-	private int mtu = IKCP_MTU_DEF; // uint32_t [IKCP_OVERHEAD+1,0x7fff]
-	private int mss;     // uint32_t [1,0x7fff-IKCP_OVERHEAD]
-	private int snd_una; // uint32_t
-	private int snd_nxt; // uint32_t
-	private int rcv_nxt; // uint32_t
+	private final int mss; // mtu-IKCP_OVERHEAD [1,0x7fff-IKCP_OVERHEAD]
+	private int snd_una;   // uint32_t
+	private int snd_nxt;   // uint32_t
+	private int rcv_nxt;   // uint32_t
 	private int ssthresh = IKCP_THRESH_INIT; // uint32_t
 	private int rx_rttval;
 	private int rx_srtt;
 	private int rx_rto = IKCP_RTO_DEF;
 	private int rx_minrto = IKCP_RTO_MIN;
-	private int snd_wnd = IKCP_WND_SND; // uint32_t
-	private int rcv_wnd = IKCP_WND_RCV; // uint32_t
+	private int snd_wnd = IKCP_WND_SND; // uint32_t [1,]
+	private int rcv_wnd = IKCP_WND_RCV; // uint32_t [IKCP_WND_RCV,]
 	private int rmt_wnd = IKCP_WND_RCV; // uint32_t [0,0xffff]
 	private int cwnd;    // uint32_t
 	private int current; // uint32_t
@@ -118,14 +66,14 @@ public abstract class Kcp {
 	private int ts_probe;   // uint32_t
 	private int probe_wait; // uint32_t
 	private int incr;       // uint32_t
-	private final Segment snd_buf = new Segment();   // input, check(R), flush
-	private final Segment snd_queue = new Segment(); // send, update->flush
-	private final Segment rcv_buf = new Segment();   // input, recv
-	private final Segment rcv_queue = new Segment(); // input, recv, peeksize(R)
+	private final KcpSeg snd_buf = new KcpSeg();   // input, check(R), flush
+	private final KcpSeg snd_queue = new KcpSeg(); // send, update->flush
+	private final KcpSeg rcv_buf = new KcpSeg();   // input, recv
+	private final KcpSeg rcv_queue = new KcpSeg(); // input, recv, peeksize(R)
 	private int ackcount;  // uint32_t
-	private int[] acklist = EMPTY_INTS; // uint32_t*
-	private byte[] buffer;
-	private int fastresend;
+	private int[] acklist = new int[16]; // uint32_t*
+	protected final byte[] buffer;
+	private int fastresend = Integer.MAX_VALUE;
 	private byte logmask;
 	private byte probe; // flags: IKCP_ASK_SEND, IKCP_ASK_TELL
 	private byte nodelay; // [0,2]
@@ -160,8 +108,9 @@ public abstract class Kcp {
 		return (b[p] & 0xff) + ((b[p + 1] & 0xff) << 8) + ((b[p + 2] & 0xff) << 16) + (b[p + 3] << 24);
 	}
 
-	private static void encode_seg(byte[] buf, int pos, Segment seg) {
-		encode32u(buf, pos, seg.conv);
+	private void encode_seg(int pos, KcpSeg seg) {
+		final byte[] buf = buffer;
+		encode32u(buf, pos, conv);
 		encode8u(buf, pos + 4, seg.cmd);
 		encode8u(buf, pos + 5, seg.frg);
 		encode16u(buf, pos + 6, seg.wnd);
@@ -174,14 +123,15 @@ public abstract class Kcp {
 	/**
 	 * create a new kcp control object, 'conv' must equal in two endpoint from the same connection.
 	 */
-	public Kcp(final int conv, final int current, final boolean stream) {
+	public Kcp(final int conv, final int current, int mtu, final byte[] buffer, final boolean stream) {
+		if (mtu <= IKCP_OVERHEAD || mtu > 0x7fff)
+			mtu = IKCP_MTU_DEF;
 		this.conv = conv;
 		this.stream = stream;
 		mss = mtu - IKCP_OVERHEAD;
-		buffer = new byte[(mtu + IKCP_OVERHEAD) * 3];
-		this.current = current;
+		this.buffer = buffer != null && buffer.length >= mtu ? buffer : new byte[mtu];
 		ts_flush = current + interval;
-		flush();
+		flush(current);
 	}
 
 	public final int conv() { // const
@@ -189,7 +139,7 @@ public abstract class Kcp {
 	}
 
 	public final boolean lost() {
-		for (Segment p = snd_buf.next; p != snd_buf; p = p.next)
+		for (KcpSeg p = snd_buf.next(); p != snd_buf; p = p.next())
 			if (p.xmit < 0 || p.xmit >= IKCP_DEADLINK)
 				return true;
 		return false;
@@ -204,16 +154,24 @@ public abstract class Kcp {
 	}
 
 	@SuppressWarnings("MethodMayBeStatic")
-	public void log(String format, Object... args) { // const
+	public void log(String format, Object... args) { // flush, input, recv
 		System.out.printf(format + "%n", args);
 	}
 
+	public KcpSeg allocSeg(int size) { // send, input
+		return new KcpSeg(size);
+	}
+
+	public void freeSeg(@SuppressWarnings("unused") KcpSeg seg) {
+	}
+
 	final void rx_minrto(final int rx_minrto) {
-		this.rx_minrto = rx_minrto;
+		if (rx_minrto >= 0)
+			this.rx_minrto = rx_minrto;
 	}
 
 	final void fastresend(final int fastresend) {
-		this.fastresend = fastresend;
+		this.fastresend = fastresend > 0 ? fastresend : Integer.MAX_VALUE;
 	}
 
 	/**
@@ -233,19 +191,7 @@ public abstract class Kcp {
 		if (resend >= 0)
 			fastresend(resend);
 		if (nc >= 0)
-			nocwnd = nc > 0;
-	}
-
-	/**
-	 * change MTU size, default is 1400
-	 */
-	public final int setmtu(final int mtu) {
-		if (mtu <= IKCP_OVERHEAD || mtu > 0x7fff)
-			return -1;
-		buffer = new byte[(mtu + IKCP_OVERHEAD) * 3];
-		this.mtu = mtu;
-		mss = mtu - IKCP_OVERHEAD;
-		return 0;
+			nocwnd = nc != 0;
 	}
 
 	/**
@@ -268,13 +214,13 @@ public abstract class Kcp {
 	/**
 	 * output callback, which will be invoked by kcp
 	 */
-	public abstract void output(byte[] buf, int len); // const
+	public abstract void output(int len); // const
 
-	private void output0(final byte[] buf, final int len) { // const
+	private void output0(final int len) { // const, flush
 		if (canlog(IKCP_LOG_OUTPUT))
 			log("[RO] %d bytes", len);
 		if (len > 0)
-			output(buf, len);
+			output(len);
 	}
 
 	/**
@@ -286,21 +232,28 @@ public abstract class Kcp {
 
 		if (stream) { // append to previous segment in streaming mode (if possible)
 			if (!snd_queue.isEmpty()) {
-				final Segment old = snd_queue.prev;
-				if (old.len < mss) {
-					final int capacity = mss - old.len;
-					final int extend = Math.min(len, capacity);
-					final Segment seg = new Segment(old.len + extend);
-					seg.linkTail(snd_queue);
-					System.arraycopy(old.data, 0, seg.data, 0, old.len);
+				final KcpSeg old = snd_queue.prev();
+				final int oldlen = old.len;
+				if (oldlen < mss) {
+					final int extend = Math.min(len, mss - oldlen);
+					final int newlen = oldlen + extend;
+					final KcpSeg seg;
+					if (old.data.length >= newlen)
+						seg = old;
+					else {
+						seg = allocSeg(newlen);
+						seg.linkTail(snd_queue);
+						System.arraycopy(old.data, 0, seg.data, 0, oldlen);
+						old.unlink();
+						freeSeg(old);
+					}
 					if (extend > 0) {
-						System.arraycopy(buf, pos, seg.data, old.len, extend);
+						System.arraycopy(buf, pos, seg.data, oldlen, extend);
 						pos += extend;
 					}
-					seg.len = old.len + extend;
+					seg.len = newlen;
 					seg.frg = 0;
 					len -= extend;
-					old.unlink();
 				}
 			}
 			if (len <= 0)
@@ -313,14 +266,13 @@ public abstract class Kcp {
 		// fragment
 		for (int i = 0; i < count; i++) { // count:[1,IKCP_WND_RCV-1]
 			final int size = Math.min(len, mss);
-			final Segment seg = new Segment(size);
+			final KcpSeg seg = allocSeg(size);
 			if (size > 0) {
 				System.arraycopy(buf, pos, seg.data, 0, size);
 				pos += size;
 			}
 			seg.len = size;
-			if (!stream)
-				seg.frg = (byte)(count - i - 1);
+			seg.frg = stream ? 0 : (byte)(count - i - 1);
 			seg.linkTail(snd_queue);
 			nsnd_que++;
 			len -= size;
@@ -331,9 +283,9 @@ public abstract class Kcp {
 	/**
 	 * flush pending data
 	 */
-	public final void flush() {
-		final Segment seg = snd_buf;
-		seg.conv = conv;
+	public final void flush(final int current) {
+		this.current = current;
+		final KcpSeg seg = snd_buf;
 		seg.cmd = IKCP_CMD_ACK;
 		// seg.frg = 0;
 		seg.wnd = (short)Math.max(rcv_wnd - nrcv_que, 0);
@@ -343,35 +295,33 @@ public abstract class Kcp {
 		// seg.len = 0;
 
 		// flush acknowledges
-		final byte[] buf = buffer;
 		int pos = 0;
 		final int count = ackcount;
 		for (int i = 0; i < count; i++) {
-			if (pos + IKCP_OVERHEAD > mtu) {
-				output0(buf, pos);
+			if (pos > mss) {
+				output0(pos);
 				pos = 0;
 			}
 			seg.sn = acklist[i * 2];
 			seg.ts = acklist[i * 2 + 1];
-			encode_seg(buf, pos, seg);
+			encode_seg(pos, seg);
 			pos += IKCP_OVERHEAD;
 		}
 		ackcount = 0;
 
 		// probe window size (if remote window size equals zero)
-		final int cur = current;
 		if (rmt_wnd == 0) {
 			if (probe_wait == 0) {
 				probe_wait = IKCP_PROBE_INIT;
-				ts_probe = cur + probe_wait;
+				ts_probe = current + probe_wait;
 			} else {
-				if (cur - ts_probe >= 0) {
+				if (current - ts_probe >= 0) {
 					if (probe_wait < IKCP_PROBE_INIT)
 						probe_wait = IKCP_PROBE_INIT;
 					probe_wait += probe_wait / 2;
 					if (probe_wait > IKCP_PROBE_LIMIT)
 						probe_wait = IKCP_PROBE_LIMIT;
-					ts_probe = cur + probe_wait;
+					ts_probe = current + probe_wait;
 					probe |= IKCP_ASK_SEND;
 				}
 			}
@@ -383,22 +333,22 @@ public abstract class Kcp {
 		// flush window probing commands
 		if ((probe & IKCP_ASK_SEND) != 0) {
 			seg.cmd = IKCP_CMD_WASK;
-			if (pos + IKCP_OVERHEAD > mtu) {
-				output0(buf, pos);
+			if (pos > mss) {
+				output0(pos);
 				pos = 0;
 			}
-			encode_seg(buf, pos, seg);
+			encode_seg(pos, seg);
 			pos += IKCP_OVERHEAD;
 		}
 
 		// flush window probing commands
 		if ((probe & IKCP_ASK_TELL) != 0) {
 			seg.cmd = IKCP_CMD_WINS;
-			if (pos + IKCP_OVERHEAD > mtu) {
-				output0(buf, pos);
+			if (pos > mss) {
+				output0(pos);
 				pos = 0;
 			}
-			encode_seg(buf, pos, seg);
+			encode_seg(pos, seg);
 			pos += IKCP_OVERHEAD;
 		}
 		probe = 0;
@@ -412,16 +362,15 @@ public abstract class Kcp {
 		while (snd_nxt - (snd_una + cwnd) < 0) {
 			if (snd_queue.isEmpty())
 				break;
-			final Segment newseg = snd_queue.next;
+			final KcpSeg newseg = snd_queue.next();
 			newseg.unlink();
 			newseg.linkTail(snd_buf);
-			newseg.conv = conv;
 			newseg.cmd = IKCP_CMD_PUSH;
 			newseg.wnd = seg.wnd;
-			newseg.ts = cur;
+			newseg.ts = current;
 			newseg.sn = snd_nxt++;
 			newseg.una = rcv_nxt;
-			newseg.resendts = cur;
+			newseg.resendts = current;
 			newseg.rto = rx_rto;
 			newseg.fastack = 0;
 			newseg.xmit = 0;
@@ -430,44 +379,44 @@ public abstract class Kcp {
 		}
 
 		// flush data segments
-		final int resent = fastresend > 0 ? fastresend : Integer.MAX_VALUE;
+		final int resent = fastresend;
 		final int rtomin = nodelay == 0 ? rx_rto >>> 3 : 0;
 		boolean change = false, lost = false;
-		for (Segment p = snd_buf.next; p != snd_buf; p = p.next) {
+		for (KcpSeg p = snd_buf.next(); p != snd_buf; p = p.next()) {
 			boolean needsend = false;
 			if (p.xmit == 0) {
 				needsend = true;
 				p.xmit++;
 				p.rto = rx_rto;
-				p.resendts = cur + p.rto + rtomin;
-			} else if (cur - p.resendts >= 0) {
+				p.resendts = current + p.rto + rtomin;
+			} else if (current - p.resendts >= 0) {
 				needsend = true;
 				p.xmit++;
 				if (nodelay == 0)
 					p.rto += Math.max(p.rto, rx_rto);
 				else
 					p.rto += (nodelay < 2 ? p.rto : rx_rto) / 2;
-				p.resendts = cur + p.rto;
+				p.resendts = current + p.rto;
 				lost = true;
 			} else if (p.fastack >= resent && p.xmit <= IKCP_FASTACK_LIMIT) {
 				needsend = true;
 				p.xmit++;
 				p.fastack = 0;
-				p.resendts = cur + p.rto;
+				p.resendts = current + p.rto;
 				change = true;
 			}
 			if (needsend) {
-				p.ts = cur;
+				p.ts = current;
 				p.wnd = seg.wnd;
 				p.una = rcv_nxt;
-				if (pos + IKCP_OVERHEAD + p.len > mtu) {
-					output0(buf, pos);
+				if (pos + p.len > mss) {
+					output0(pos);
 					pos = 0;
 				}
-				encode_seg(buf, pos, p);
+				encode_seg(pos, p);
 				pos += IKCP_OVERHEAD;
 				if (p.len > 0) {
-					System.arraycopy(p.data, 0, buf, pos, p.len);
+					System.arraycopy(p.data, 0, buffer, pos, p.len);
 					pos += p.len;
 				}
 			}
@@ -475,7 +424,7 @@ public abstract class Kcp {
 
 		// flush remain segments
 		if (pos > 0)
-			output0(buf, pos);
+			output0(pos);
 
 		// update ssthresh
 		if (lost) {
@@ -510,16 +459,17 @@ public abstract class Kcp {
 	}
 
 	private void shrink_buf() { // only for input
-		final Segment p = snd_buf.next;
+		final KcpSeg p = snd_buf.next();
 		snd_una = p != snd_buf ? p.sn : snd_nxt;
 	}
 
 	private void parse_ack(final int sn) { // uint32_t, only for input
 		if (sn - snd_una < 0 || sn - snd_nxt >= 0)
 			return;
-		for (Segment p = snd_buf.next; p != snd_buf && sn - p.sn >= 0; p = p.next) {
+		for (KcpSeg p = snd_buf.next(); p != snd_buf && sn - p.sn >= 0; p = p.next()) {
 			if (sn == p.sn) {
 				p.unlink();
+				freeSeg(p);
 				nsnd_buf--;
 				break;
 			}
@@ -527,8 +477,11 @@ public abstract class Kcp {
 	}
 
 	private void parse_una(final int una) { // uint32_t, only for input
-		for (Segment p = snd_buf.next; p != snd_buf && una - p.sn > 0; p = p.next) {
+		for (KcpSeg p = snd_buf.next(); p != snd_buf && una - p.sn > 0; ) {
+			final KcpSeg next = p.next();
 			p.unlink();
+			freeSeg(p);
+			p = next;
 			nsnd_buf--;
 		}
 	}
@@ -536,7 +489,7 @@ public abstract class Kcp {
 	private void parse_fastack(final int sn, final int ts) { // uint32_t, only for input
 		if (sn - snd_una < 0 || sn - snd_nxt >= 0)
 			return;
-		for (Segment p = snd_buf.next; p != snd_buf && sn - p.sn >= 0; p = p.next)
+		for (KcpSeg p = snd_buf.next(); p != snd_buf && sn - p.sn >= 0; p = p.next())
 			if (sn != p.sn && (!IKCP_FASTACK_CONSERVE || ts - p.ts >= 0))
 				p.fastack++;
 	}
@@ -544,7 +497,7 @@ public abstract class Kcp {
 	private void ack_push(final int sn, final int ts) { // uint32_t, only for input
 		final int newsize = ackcount + 1;
 		if (newsize * 2 > acklist.length) {
-			int newblock = 8;
+			int newblock = 16;
 			while (newblock < newsize)
 				newblock <<= 1;
 			acklist = Arrays.copyOf(acklist, newblock * 2);
@@ -554,25 +507,29 @@ public abstract class Kcp {
 		ackcount = newsize;
 	}
 
-	private void parse_data(final Segment newseg) { // only for input
+	private void parse_data(final KcpSeg newseg) { // only for input
 		final int sn = newseg.sn;
-		if (sn - (rcv_nxt + rcv_wnd) >= 0 || sn - rcv_nxt < 0)
+		if (sn - (rcv_nxt + rcv_wnd) >= 0 || sn - rcv_nxt < 0) {
+			freeSeg(newseg);
 			return;
+		}
 
 		boolean repeat = false;
-		Segment p = rcv_buf.prev;
-		for (; p != rcv_buf && sn - p.sn <= 0; p = p.prev) {
+		KcpSeg p = rcv_buf.prev();
+		for (; p != rcv_buf && sn - p.sn <= 0; p = p.prev()) {
 			if (p.sn == sn) {
 				repeat = true;
 				break;
 			}
 		}
-		if (!repeat)
+		if (repeat)
+			freeSeg(newseg);
+		else
 			newseg.linkNext(p);
 
 		// move available data from rcv_buf -> rcv_queue
 		while (!rcv_buf.isEmpty()) {
-			final Segment seg = rcv_buf.next;
+			final KcpSeg seg = rcv_buf.next();
 			if (seg.sn != rcv_nxt || nrcv_que >= rcv_wnd)
 				break;
 			seg.unlink();
@@ -595,7 +552,7 @@ public abstract class Kcp {
 		boolean flag = false;
 		while (len >= IKCP_OVERHEAD) {
 			if (decode32u(buf, pos) != conv)
-				return -1;
+				return -2;
 			final int cmd = decode8u(buf, pos + 4);
 			final int frg = decode8u(buf, pos + 5);
 			final int wnd = decode16u(buf, pos + 6);
@@ -606,9 +563,9 @@ public abstract class Kcp {
 			pos += IKCP_OVERHEAD;
 			len -= IKCP_OVERHEAD;
 			if (len < size || size < 0)
-				return -2;
-			if (cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK && cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS)
 				return -3;
+			if (cmd != IKCP_CMD_PUSH && cmd != IKCP_CMD_ACK && cmd != IKCP_CMD_WASK && cmd != IKCP_CMD_WINS)
+				return -4;
 
 			rmt_wnd = wnd;
 			parse_una(una);
@@ -634,8 +591,7 @@ public abstract class Kcp {
 				if (sn - (rcv_nxt + rcv_wnd) < 0) {
 					ack_push(sn, ts);
 					if (sn - rcv_nxt >= 0) {
-						final Segment seg = new Segment(size);
-						seg.conv = conv;
+						final KcpSeg seg = allocSeg(size);
 						seg.cmd = (byte)cmd;
 						seg.frg = (byte)frg;
 						seg.wnd = (short)wnd;
@@ -687,39 +643,36 @@ public abstract class Kcp {
 	public final int peeksize() { // const, rcv_queue=>size
 		if (rcv_queue.isEmpty())
 			return -1;
-		Segment p = rcv_queue.next;
+		KcpSeg p = rcv_queue.next();
 		if (p.frg == 0)
 			return p.len;
 		if (nrcv_que < (p.frg & 0xff) + 1)
-			return -1;
-		int len = 0;
-		for (; p != rcv_queue; p = p.next) {
+			return -2;
+		for (int len = 0; p != rcv_queue; p = p.next()) {
 			len += p.len;
 			if (p.frg == 0)
-				break;
+				return len;
 		}
-		return len;
+		return -3;
 	}
 
 	/**
 	 * user/upper level recv: returns size, returns below zero for EAGAIN
 	 */
 	public final int recv(final byte[] buf, int pos, int len) { // rcv_queue=>buf, rcv_buf=>rcv_queue
-		if (rcv_queue.isEmpty())
-			return -1;
+		final int peeksize = peeksize();
+		if (peeksize < 0)
+			return peeksize;
 		final boolean ispeek = len < 0;
 		if (ispeek)
 			len = -len;
-		final int peeksize = peeksize();
-		if (peeksize < 0)
-			return -2;
 		if (peeksize > len)
-			return -3;
+			return -4;
 
 		// merge fragment
 		final boolean recover = nrcv_que >= rcv_wnd;
 		len = 0;
-		for (Segment p = rcv_queue.next; p != rcv_queue; p = p.next) {
+		for (KcpSeg p = rcv_queue.next(); p != rcv_queue; ) {
 			if (buf != null) {
 				System.arraycopy(p.data, 0, buf, pos, p.len);
 				pos += p.len;
@@ -727,17 +680,21 @@ public abstract class Kcp {
 			len += p.len;
 			if (canlog(IKCP_LOG_RECV))
 				log("recv sn=%d", p.sn);
+			final byte frg = p.frg;
+			final KcpSeg next = p.next();
 			if (!ispeek) {
 				p.unlink();
+				freeSeg(p);
 				nrcv_que--;
 			}
-			if (p.frg == 0)
+			p = next;
+			if (frg == 0)
 				break;
 		}
 
 		// move available data from rcv_buf -> rcv_queue
 		while (!rcv_buf.isEmpty()) {
-			final Segment seg = rcv_buf.next;
+			final KcpSeg seg = rcv_buf.next();
 			if (seg.sn != rcv_nxt || nrcv_que >= rcv_wnd)
 				break;
 			seg.unlink();
@@ -760,16 +717,14 @@ public abstract class Kcp {
 	 * use it to schedule 'update' (eg. implementing an epoll-like mechanism,
 	 * or optimize 'update' when handling massive kcp connections)
 	 */
-	public final int check(final int current) // uint32_t, return uint32_t, const but ts_flush
+	public final int check(final int current) // const
 	{
 		final int tm_flush = ts_flush - current;
-		if (tm_flush <= -10000 || tm_flush > 10000)
-			ts_flush = current;
-		if (tm_flush <= 0)
+		if (tm_flush <= 0 || tm_flush > 10000)
 			return current;
 		int tm_packet = Integer.MAX_VALUE;
-		for (Segment p = snd_buf.next; p != snd_buf; p = p.next) {
-			int diff = p.resendts - current;
+		for (KcpSeg p = snd_buf.next(); p != snd_buf; p = p.next()) {
+			final int diff = p.resendts - current;
 			if (diff <= 0)
 				return current;
 			if (tm_packet > diff)
@@ -783,19 +738,16 @@ public abstract class Kcp {
 	 * or you can ask 'check' when to call it again (without 'input/send' calling).
 	 * 'current' - current timestamp in millisec.
 	 */
-	public final void update(final int current) // uint32_t
-	{
-		this.current = current;
+	public final void update(final int current) {
 		final int slap = current - ts_flush;
-		if (slap >= 10000 || slap < -10000)
+		if (slap < -10000 || slap >= interval)
 			ts_flush = current + interval;
-		else if (slap < 0)
-			return;
-		else {
+		else if (slap >= 0)
 			ts_flush += interval;
-			if (ts_flush - current < 0)
-				ts_flush = current + interval;
+		else {
+			this.current = current;
+			return;
 		}
-		flush();
+		flush(current);
 	}
 }
