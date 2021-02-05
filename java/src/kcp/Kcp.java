@@ -73,7 +73,7 @@ public abstract class Kcp {
 	private int ackcount;  // uint32_t
 	private int[] acklist = new int[16]; // uint32_t*
 	protected final byte[] buffer;
-	private int fastresend = Integer.MAX_VALUE;
+	private int fastresend = -1;
 	private byte logmask;
 	private byte probe; // flags: IKCP_ASK_SEND, IKCP_ASK_TELL
 	private byte nodelay; // [0,2]
@@ -171,7 +171,7 @@ public abstract class Kcp {
 	}
 
 	final void fastresend(final int fastresend) {
-		this.fastresend = fastresend > 0 ? fastresend : Integer.MAX_VALUE;
+		this.fastresend = fastresend > 0 ? fastresend : -1;
 	}
 
 	/**
@@ -379,8 +379,6 @@ public abstract class Kcp {
 		}
 
 		// flush data segments
-		final int resent = fastresend;
-		final int rtomin = nodelay == 0 ? rx_rto >>> 3 : 0;
 		boolean change = false, lost = false;
 		for (KcpSeg p = snd_buf.next(); p != snd_buf; p = p.next()) {
 			boolean needsend = false;
@@ -388,7 +386,7 @@ public abstract class Kcp {
 				needsend = true;
 				p.xmit++;
 				p.rto = rx_rto;
-				p.resendts = current + p.rto + rtomin;
+				p.resendts = current + rx_rto + (nodelay == 0 ? rx_rto >>> 3 : 0);
 			} else if (current - p.resendts >= 0) {
 				needsend = true;
 				p.xmit++;
@@ -398,7 +396,7 @@ public abstract class Kcp {
 					p.rto += (nodelay < 2 ? p.rto : rx_rto) / 2;
 				p.resendts = current + p.rto;
 				lost = true;
-			} else if (p.fastack >= resent && p.xmit <= IKCP_FASTACK_LIMIT) {
+			} else if (p.fastack >= (fastresend & 0x7fffffff) && p.xmit <= IKCP_FASTACK_LIMIT) {
 				needsend = true;
 				p.xmit++;
 				p.fastack = 0;
@@ -428,19 +426,16 @@ public abstract class Kcp {
 
 		// update ssthresh
 		if (lost) {
-			ssthresh = cwnd / 2;
-			if (ssthresh < IKCP_THRESH_MIN)
-				ssthresh = IKCP_THRESH_MIN;
+			ssthresh = Math.max(cwnd / 2, IKCP_THRESH_MIN);
 			this.cwnd = 1;
 			incr = mss;
-		} else if (change) {
-			ssthresh = (snd_nxt - snd_una) / 2;
-			if (ssthresh < IKCP_THRESH_MIN)
-				ssthresh = IKCP_THRESH_MIN;
-			this.cwnd = ssthresh + resent;
-			incr = this.cwnd * mss;
+			return;
 		}
-		if (this.cwnd < 1) {
+		if (change) {
+			ssthresh = Math.max((snd_nxt - snd_una) / 2, IKCP_THRESH_MIN);
+			this.cwnd = Math.max(ssthresh + fastresend, 1);
+			incr = this.cwnd * mss;
+		} else if (this.cwnd < 1) {
 			this.cwnd = 1;
 			incr = mss;
 		}
